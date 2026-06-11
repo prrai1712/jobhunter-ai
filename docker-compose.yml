@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # Database Service: PostgreSQL 16
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: jobhunter_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-jobhunter}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-jobhunter_secure_pass_2026}
+      POSTGRES_DB: ${DB_NAME:-jobhunter_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432" # Bind to localhost only for security
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ---------------------------------------------------------------------------
+  # Application Service: JobHunter AI
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jobhunter_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Inject DB urls dynamically based on compose service name
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DATABASE_URL: postgresql+asyncpg://${DB_USER:-jobhunter}:${DB_PASSWORD:-jobhunter_secure_pass_2026}@postgres:5432/${DB_NAME:-jobhunter_db}
+      DATABASE_URL_SYNC: postgresql://${DB_USER:-jobhunter}:${DB_PASSWORD:-jobhunter_secure_pass_2026}@postgres:5432/${DB_NAME:-jobhunter_db}
+    volumes:
+      - app_data:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1.5G  # Account for Playwright Chromium instances
+        reservations:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Backup Service: Periodic pg_dump of database
+  # ---------------------------------------------------------------------------
+  pgbackup:
+    image: postgres:16-alpine
+    container_name: jobhunter_backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - app_data:/app/data
+      - postgres_data:/var/lib/postgresql/data:ro
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:-jobhunter_secure_pass_2026}
+      DB_USER: ${DB_USER:-jobhunter}
+      DB_NAME: ${DB_NAME:-jobhunter_db}
+    entrypoint: |
+      /bin/sh -c '
+      echo "Starting backup worker loop..."
+      mkdir -p /app/data/backups
+      while true; do
+        # Run daily backup at 2 AM
+        sleep 86400 &
+        SLEEP_PID=$$!
+        # Perform backup
+        TIMESTAMP=$$(date +%Y%m%d_%H%M%S)
+        FILE="/app/data/backups/backup_$${TIMESTAMP}.sql"
+        echo "[$$(date)] Creating backup at $${FILE}..."
+        pg_dump -h postgres -U $${DB_USER} -d $${DB_NAME} -f $${FILE}
+        # Keep only the last 7 backups
+        ls -tp /app/data/backups/backup_*.sql | grep -v "/$$" | tail -n +8 | xargs -I {} rm -- {}
+        wait $$SLEEP_PID
+      done
+      '
+
+volumes:
+  postgres_data:
+    driver: local
+  app_data:
+    driver: local
